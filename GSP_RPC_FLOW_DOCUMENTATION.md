@@ -495,6 +495,120 @@ return (status == NV_OK) ? NV_WARN_NOTHING_TO_DO : status;
 
 ## 第四阶段：业务实现与 RPC 传输 (Business Logic & RPC)
 
+### 3.6 RMAPI 函数指针替换机制（重要补充）
+
+**关键发现**：在 GSP 客户端模式下，RMAPI 的函数指针会在初始化时被替换为 RPC 版本。
+
+**文件**: `src/nvidia/src/kernel/rmapi/rpc_common.c`  
+**函数**: `rpcRmApiSetup` (行 54)  
+**作用**: 
+- 在 RPC 对象初始化时，根据 GPU 模式替换 RMAPI 函数指针
+- 对于 GSP 客户端模式：将 `pRmApi->Control` 替换为 `rpcRmApiControl_GSP`
+
+**关键代码**:
+```c
+// 行 74-80: GSP 客户端模式下的函数指针替换
+else if (IS_GSP_CLIENT(pGpu))
+{
+    pRmApi->Control         = rpcRmApiControl_GSP;
+    pRmApi->AllocWithHandle = rpcRmApiAlloc_GSP;
+    pRmApi->Free            = rpcRmApiFree_GSP;
+    pRmApi->DupObject       = rpcRmApiDupObject_GSP;
+}
+```
+
+**重要说明**：
+1. **只替换 `Control`，不替换 `ControlWithSecInfo`**：
+   - `pRmApi->Control` → `rpcRmApiControl_GSP`（被替换）
+   - `pRmApi->ControlWithSecInfo` → `rmapiControlWithSecInfo`（**不被替换**）
+
+2. **对文档流程的影响**：
+   - 文档中描述的标准路径使用的是 `pRmApi->ControlWithSecInfo()`（行 106）
+   - 因此，**从用户态到 `rmresControl_Prologue_IMPL` 的标准流程不受影响**
+   - 函数指针替换主要影响的是：
+     - **直接调用 `pRmApi->Control()` 的代码路径**
+     - **`NV_RM_RPC_CONTROL` 宏内部的调用**（见下文）
+
+3. **`NV_RM_RPC_CONTROL` 宏的影响**：
+   - 当 `rmresControl_Prologue_IMPL` 检测到 RPC 条件满足时，会调用 `NV_RM_RPC_CONTROL` 宏
+   - 该宏内部调用 `pRmApi->Control()`（行 229），此时使用的是**已被替换**的 `rpcRmApiControl_GSP`
+   - `rpcRmApiControl_GSP` **直接**准备并发送 RPC 消息，**不经过** `_rmapiRmControl` → `serverControl` 等步骤
+   - 这是**预期的行为**，因为此时已经确定了需要 RPC 路由，无需再经过完整的本地处理流程
+
+4. **两种路径的对比**：
+
+   **路径 A（文档标准路径，满足 RPC 条件）**：
+   ```
+   用户态 → nvidia_ioctl → Nv04ControlWithSecInfo → 
+   pRmApi->ControlWithSecInfo (rmapiControlWithSecInfo) → 
+   _rmapiRmControl → serverControl → resControl_IMPL → 
+   rmresControl_Prologue_IMPL (检测到 RPC 条件) → 
+   NV_RM_RPC_CONTROL → pRmApi->Control (rpcRmApiControl_GSP) → 
+   直接发送 RPC（跳过后续本地处理）
+   ```
+
+   **路径 B（如果直接调用 `pRmApi->Control()`）**：
+   ```
+   直接调用 pRmApi->Control() → rpcRmApiControl_GSP → 
+   直接发送 RPC（完全绕过标准 RMAPI 流程）
+   ```
+
+**结论**：文档中描述的流程在 GSP 客户端模式下**仍然有效**，因为标准路径使用的是 `ControlWithSecInfo`，而函数指针替换只影响 `Control`。但在 `NV_RM_RPC_CONTROL` 宏调用时，会使用被替换的 `rpcRmApiControl_GSP`，这是设计的预期行为，用于在确定需要 RPC 路由时直接发送 RPC，避免不必要的本地处理开销。
+
+#### 内部转发路径（间接通过 ioctl）
+
+**重要发现**：虽然用户态 ioctl 不直接调用 `pRmApi->Control()`，但存在一个**内部转发路径**，可能会间接调用被替换的函数指针：
+
+**文件**: `src/nvidia/src/kernel/gpu/gpu_resource.c`  
+**函数**: `gpuresInternalControlForward_IMPL` (行 364-380)  
+**作用**: 
+- 某些内部控制命令的处理函数可能会调用此函数来转发到物理 RM
+- 此函数**直接调用** `pRmApi->Control()`，在 GSP 客户端模式下会使用被替换的 `rpcRmApiControl_GSP`
+
+**关键代码**:
+```c
+// 行 373-379: 直接调用 pRmApi->Control()
+RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(GPU_RES_GET_GPU(pGpuResource));
+return pRmApi->Control(pRmApi,
+                       RES_GET_CLIENT_HANDLE(pGpuResource),
+                       gpuresGetInternalObjectHandle(pGpuResource),
+                       command,
+                       pParams,
+                       size);
+```
+
+**调用场景**：
+- 某些资源对象（如 `Subdevice`、`Device`、`KernelGraphicsContext` 等）的内部控制命令处理函数
+- 这些处理函数可能通过 `gpuresInternalControlForward` 转发到物理 RM
+- 在 GSP 客户端模式下，这会**直接调用** `rpcRmApiControl_GSP`，**绕过**标准流程中的 `rmresControl_Prologue_IMPL` 检查
+
+**示例**：
+```c
+// src/nvidia/src/kernel/gpu/subdevice/subdevice.c:245-254
+subdeviceInternalControlForward_IMPL(...)
+{
+    // 调用 gpuresInternalControlForward_IMPL
+    // → 直接调用 pRmApi->Control() (在 GSP 模式下是 rpcRmApiControl_GSP)
+}
+```
+
+**与标准路径的区别**：
+
+| 特性 | 标准 ioctl 路径 | 内部转发路径 |
+|------|---------------|-------------|
+| **入口** | `Nv04ControlWithSecInfo` | `gpuresInternalControlForward_IMPL` |
+| **RMAPI 调用** | `pRmApi->ControlWithSecInfo()` | `pRmApi->Control()` |
+| **函数指针** | 不被替换（使用标准实现） | **被替换**（GSP 模式下使用 `rpcRmApiControl_GSP`） |
+| **是否经过 `rmresControl_Prologue_IMPL`** | ✅ 是 | ❌ **否** |
+| **RPC 路由检查** | 在 `rmresControl_Prologue_IMPL` 中检查 | **直接发送 RPC**（在 GSP 模式下） |
+
+**重要说明**：
+- 内部转发路径不是从用户态 ioctl **直接**调用的，而是从内核内部的资源对象方法中调用的
+- 这意味着某些内部控制命令在 GSP 客户端模式下会**自动**通过 RPC 发送，无需经过标准的路由检查
+- 这是**设计的预期行为**，因为这些是内部控制命令，通常都需要在物理 RM（GSP）端执行
+
+---
+
 ### 4.1 RPC 控制宏
 **文件**: `src/nvidia/inc/kernel/vgpu/rpc.h`  
 **宏定义**: `NV_RM_RPC_CONTROL` (行 223)  
@@ -505,12 +619,18 @@ return (status == NV_OK) ? NV_WARN_NOTHING_TO_DO : status;
 
 **关键代码**:
 ```c
-// 行 230-234: GSP 客户端路径
+// 行 226-230: GSP 客户端路径
 if (IS_FW_CLIENT(pGpu)) {
     RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+    // 注意：这里的 pRmApi->Control 在 GSP 客户端模式下已被替换为 rpcRmApiControl_GSP
     status = pRmApi->Control(pRmApi, hClient, hObject, cmd, pParams, paramSize);
 }
 ```
+
+**关键说明**：
+- 在 GSP 客户端模式下，`pRmApi->Control` 已在初始化时被替换为 `rpcRmApiControl_GSP`
+- 因此，`NV_RM_RPC_CONTROL` 宏实际上直接调用 `rpcRmApiControl_GSP`，**不会**再经过 `_rmapiRmControl` 等标准流程
+- 这是设计的预期行为：在确定需要 RPC 路由后，直接发送 RPC，避免不必要的本地处理
 
 ### 4.2 GSP RPC 控制实现
 **文件**: `src/nvidia/src/kernel/vgpu/rpc.c`  
@@ -770,29 +890,45 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 8. RPC 路由拦截: rmresControl_Prologue_IMPL (resource.c:254)
    ├─ 检查: IS_FW_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL
    ├─ ✅ 条件满足
-   └─ 执行 RPC: NV_RM_RPC_CONTROL → rpcRmApiControl_GSP
+   └─ 执行 RPC: NV_RM_RPC_CONTROL → pRmApi->Control()
+       └─ 注意：pRmApi->Control 在 GSP 客户端模式下已被替换为 rpcRmApiControl_GSP
 
-9. RPC 传输: GspMsgQueueSendCommand → kgspSetCmdQueueHead_HAL
-   ├─ 复制命令到共享内存队列
-   ├─ 更新写指针
-   └─ 触发硬件中断
+9. RPC 直接发送: rpcRmApiControl_GSP (rpc.c:10977)
+   ├─ 准备 RPC 消息头（跳过标准 RMAPI 流程）
+   ├─ 填充 RPC 参数结构
+   ├─ 复制命令参数到 RPC 消息缓冲区
+   └─ 调用 _issueRpcAndWait 发送并等待响应
 
-10. GSP 执行: 固件处理命令 → 写回结果
+10. RPC 传输: GspMsgQueueSendCommand → kgspSetCmdQueueHead_HAL
+    ├─ 复制命令到共享内存队列
+    ├─ 更新写指针
+    └─ 触发硬件中断
+
+11. GSP 执行: 固件处理命令 → 写回结果
     └─ 填充功能位掩码、固件版本等信息
 
-11. RPC 接收: GspMsgQueueReceiveStatus → 复制结果
+12. RPC 接收: GspMsgQueueReceiveStatus → 复制结果
     └─ 从共享内存读取响应
 
-12. 返回处理: NV_WARN_NOTHING_TO_DO
+13. RPC 响应处理: rpcRmApiControl_GSP 复制响应数据
+    └─ 将响应参数复制回原始参数缓冲区
+
+14. 返回处理: rmresControl_Prologue_IMPL 返回 NV_WARN_NOTHING_TO_DO
     └─ resControl_IMPL 检测到 NV_WARN_NOTHING_TO_DO，跳过本地函数调用
 
-13. 层层返回: 结果复制回用户空间
+15. 层层返回: 结果复制回用户空间
     └─ 用户态获得有效数据 (bValid = NV_TRUE)
 ```
 
 **关键时间点**: 
-- **步骤 8** 是决定性的：如果条件满足，RPC 在这里完成，后续步骤 12 会跳过本地函数
-- **步骤 12** 是关键分支：`NV_WARN_NOTHING_TO_DO` 导致本地函数不被调用
+- **步骤 8** 是决定性的：如果条件满足，RPC 在这里完成
+- **步骤 9** 是关键：`rpcRmApiControl_GSP` 直接发送 RPC，**不经过** `_rmapiRmControl` → `serverControl` 等步骤
+- **步骤 14** 是关键分支：`NV_WARN_NOTHING_TO_DO` 导致本地函数不被调用
+
+**重要说明**：
+- 在步骤 9 中，由于 `pRmApi->Control` 已被替换为 `rpcRmApiControl_GSP`，所以 `NV_RM_RPC_CONTROL` 宏直接调用 `rpcRmApiControl_GSP`
+- `rpcRmApiControl_GSP` 会执行完整的 RPC 发送和接收流程（步骤 9-13），但**跳过**了标准的本地 RMAPI 处理流程（`_rmapiRmControl`、`serverControl` 等）
+- 这是设计的预期行为：在确定需要 RPC 路由后，直接发送 RPC，避免不必要的本地处理开销
 
 ### 不满足 RPC 条件的执行流程
 
@@ -826,6 +962,7 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 6. **参数序列化**: 支持大消息的分片传输和序列化/反序列化
 7. **标志获取**: 命令标志在 `_rmapiRmControl` 阶段获取，存储在 Cookie 中传递
 8. **路径选择**: 基于 `IS_FW_CLIENT` 和 `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` 两个条件决定执行路径
+9. **函数指针替换**: 在 GSP 客户端模式下，`pRmApi->Control` 在初始化时被替换为 `rpcRmApiControl_GSP`，但标准路径使用 `ControlWithSecInfo`，因此不受影响；只有在 `NV_RM_RPC_CONTROL` 宏中调用 `pRmApi->Control()` 时才会使用替换后的函数
 
 ### 设计说明
 
