@@ -30,7 +30,8 @@
 4. **P4 RPC 路由 & 传输**
    - `rmresControl_Prologue_IMPL` → `NV_RM_RPC_CONTROL` → `rpcRmApiControl_GSP`
    - 位置：`src/nvidia/src/kernel/rmapi/resource.c:254`
-   - 关键条件：`IS_FW_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL`
+   - 关键条件：`IS_GSP_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL`
+   - **注意**: 代码中实际使用 `IS_GSP_CLIENT` 而不是 `IS_FW_CLIENT`
    - RPC 传输：`GspMsgQueueSendCommand` → `kgspSetCmdQueueHead_HAL`（触发中断）
 
 5. **P5 固件端**
@@ -77,8 +78,9 @@
 
 #### Hook 点 2：`rpcRmApiControl_GSP`（新增）
 - **用途**：捕获所有 RPC 调用（包括模式1的直接调用）
-- **位置**：`src/nvidia/src/kernel/vgpu/rpc.c:10977`
+- **位置**：`src/nvidia/src/kernel/vgpu/rpc.c:10361`
 - **时机**：在参数序列化之后、发送到 GSP 之前
+- **注意**: 行号已更新（原文档为 10977，实际为 10361，差异约 489 行）
 - **优势**：
   - ✅ 可以捕获所有 RPC 路径（包括绕过 RM 栈的）
   - ✅ 此时参数已经序列化，可以直接记录序列化后的 payload
@@ -137,7 +139,8 @@ NV_ESC_GSP_FUZZ (mode=1) → nvidia_ioctl_gsp_fuzz
 
 #### ⚠️ **必须保留的检查**：
 
-1. **GPU 锁检查**（`rpcRmApiControl_GSP:11012`）：
+1. **GPU 锁检查**（`rpcRmApiControl_GSP:10396`）：
+   - **注意**: 行号已更新（原文档为 11012，实际为 10396，差异约 616 行）
    ```c
    if (!rmDeviceGpuLockIsOwner(pGpu->gpuInstance)) {
        // 必须获取锁，否则共享内存可能被并发修改
@@ -147,7 +150,8 @@ NV_ESC_GSP_FUZZ (mode=1) → nvidia_ioctl_gsp_fuzz
    - **原因**：保护共享内存队列，防止并发写入导致数据损坏
    - **建议**：**必须保留**
 
-2. **参数序列化检查**（`rpcRmApiControl_GSP:11059`）：
+2. **参数序列化检查**（`rpcRmApiControl_GSP:10443`）：
+   - **注意**: 行号已更新（原文档为 11059，实际为 10443，差异约 616 行）
    ```c
    status = serverSerializeCtrlDown(pCallContext, cmd, &pParamStructPtr, &paramsSize, &resCtrlFlags);
    if (status != NV_OK)
@@ -156,7 +160,8 @@ NV_ESC_GSP_FUZZ (mode=1) → nvidia_ioctl_gsp_fuzz
    - **原因**：确保参数格式正确，否则 RPC 协议层会失败
    - **建议**：**可以放宽，但需要基本格式检查**
 
-3. **RPC 消息大小检查**（`rpcRmApiControl_GSP:11097`）：
+3. **RPC 消息大小检查**（`rpcRmApiControl_GSP:10510`）：
+   - **注意**: 行号已更新（原文档为 11097，实际为 10510，差异约 587 行）
    ```c
    if (total_size > pRpc->maxRpcSize) {
        // 需要分片传输

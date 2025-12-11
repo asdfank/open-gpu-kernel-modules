@@ -56,24 +56,18 @@
 
 ### 1.2 系统调用入口
 **文件**: `kernel-open/nvidia/nv.c`  
-**函数**: `nvidia_ioctl` (行 2377)  
+**函数**: `nvidia_ioctl` (行 2419)  
 **作用**: 
 - 接收用户态 `ioctl(fd, NV_ESC_RM_CONTROL, &params)` 调用
 - 进行基本的权限检查
 - 从用户空间复制参数到内核空间
-- 识别 IOCTL 命令码 `NV_ESC_RM_CONTROL`
+- 将控制权转发到 escape 层处理
 
-**关键代码**:
-```c
-// 行 2502-2504: 识别 NV_ESC_RM_CONTROL 命令
-switch (arg_cmd)
-{
-    case NV_ESC_RM_CONTROL:
-```
+**说明**: `NV_ESC_RM_CONTROL` 的实际处理在 escape 层（见 1.3 节），`nvidia_ioctl` 主要负责参数复制和转发。
 
 ### 1.3 Escape 层转换
 **文件**: `src/nvidia/arch/nvalloc/unix/src/escape.c`  
-**函数**: `__kapi_RmIoctl` → `Nv04ControlWithSecInfo` (行 764)  
+**函数**: `Nv04ControlWithSecInfo` (行 759)  
 **作用**: 
 - 将 Linux 特定的 `file_private` 数据转换为 RM 内部的 `hClient` 句柄
 - 构建 `API_SECURITY_INFO` 安全信息结构
@@ -81,13 +75,13 @@ switch (arg_cmd)
 
 **关键代码**:
 ```c
-// 行 716-777: 处理 NV_ESC_RM_CONTROL
+// 行 711-772: 处理 NV_ESC_RM_CONTROL
 case NV_ESC_RM_CONTROL:
 {
     NVOS54_PARAMETERS *pApi = data;
     // ... 获取 file_private 并转换为 hClient ...
     secInfo.gpuOsInfo = priv;
-    Nv04ControlWithSecInfo(pApi, secInfo);  // 行 764
+    Nv04ControlWithSecInfo(pApi, secInfo);  // 行 759
 }
 ```
 
@@ -252,7 +246,7 @@ if (pEntry->paramSize == 0) {
 **文件**: `src/nvidia/src/kernel/rmapi/resource.c`  
 **函数**: `rmresControl_Prologue_IMPL` (行 254)  
 **作用**: 
-- **检查是否需要 RPC 路由**: 判断 `IS_FW_CLIENT(pGpu)` 且命令带有 `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` 标志
+- **检查是否需要 RPC 路由**: 判断 `IS_GSP_CLIENT(pGpu)` 且命令带有 `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` 标志
 - **如果匹配**: 直接调用 `NV_RM_RPC_CONTROL` 宏，**跳过**后续的具体处理函数调用
 - **返回**: `NV_WARN_NOTHING_TO_DO` 表示已在 Prologue 阶段处理完成
 
@@ -261,7 +255,7 @@ if (pEntry->paramSize == 0) {
 // 行 264-266: 检查是否需要 RPC 路由
 if (pGpu != NULL &&
     ((IS_VIRTUAL(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_VGPU_HOST))
-     || (IS_FW_CLIENT(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_PHYSICAL))))
+     || (IS_GSP_CLIENT(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_PHYSICAL))))
 {
     // 行 289-290: 执行 RPC 调用
     NV_RM_RPC_CONTROL(pGpu, pParams->hClient, pParams->hObject, pParams->cmd,
@@ -275,8 +269,10 @@ if (pGpu != NULL &&
 return NV_OK;
 ```
 
+**重要说明**: 代码中直接使用 `IS_GSP_CLIENT(pGpu)` 而不是 `IS_FW_CLIENT(pGpu)`。虽然 `IS_FW_CLIENT` 可能定义为 `IS_GSP_CLIENT || IS_DCE_CLIENT`，但当前实现只检查 GSP 客户端的情况。
+
 **关键逻辑说明**:
-1. **满足 RPC 条件** (`IS_FW_CLIENT` + `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL`):
+1. **满足 RPC 条件** (`IS_GSP_CLIENT` + `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL`):
    - 执行 RPC 调用
    - 返回 `NV_WARN_NOTHING_TO_DO`
    - **结果**: `resControl_IMPL` 检测到 `NV_WARN_NOTHING_TO_DO`，直接返回，**不会调用本地函数**（如 `subdeviceCtrlCmdGspGetFeatures_KERNEL`）
@@ -345,14 +341,14 @@ rmCtrlParams.pCookie->ctrlFlags = ctrlFlags;
 // 行 264-266: 两个条件必须同时满足
 if (pGpu != NULL &&
     ((IS_VIRTUAL(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_VGPU_HOST))
-     || (IS_FW_CLIENT(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_PHYSICAL))))
+     || (IS_GSP_CLIENT(pGpu) && (pParams->pCookie->ctrlFlags & RMCTRL_FLAGS_ROUTE_TO_PHYSICAL))))
 ```
 
 **关键条件说明**:
-1. **`IS_FW_CLIENT(pGpu)`**: 
-   - 定义为 `IS_GSP_CLIENT(pGpu) || IS_DCE_CLIENT(pGpu)`
-   - 表示当前 GPU 运行在固件客户端模式（GSP 或 DCE 作为资源管理前端）
+1. **`IS_GSP_CLIENT(pGpu)`**: 
+   - 表示当前 GPU 运行在 GSP 客户端模式（GSP 作为资源管理前端）
    - 在 GSP 客户端模式下，CPU-RM 是"瘦客户端"，大部分 GPU 操作由 GSP 固件执行
+   - **注意**: 代码中直接使用 `IS_GSP_CLIENT` 而不是 `IS_FW_CLIENT`，只检查 GSP 客户端情况
 
 2. **`RMCTRL_FLAGS_ROUTE_TO_PHYSICAL`**:
    - 这个标志在命令定义时设置（通常在 `.def` 文件中）
@@ -436,19 +432,19 @@ subdeviceCtrlCmdGspGetFeatures_KERNEL
 #### 场景分析
 
 **场景 1: GSP 客户端模式 + ROUTE_TO_PHYSICAL 标志**
-- **条件**: `IS_FW_CLIENT(pGpu) == TRUE` && `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL == TRUE`
+- **条件**: `IS_GSP_CLIENT(pGpu) == TRUE` && `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL == TRUE`
 - **路径**: GSP 卸载路径
 - **结果**: `bValid = NV_TRUE`，数据有效
 - **本地函数**: **不会调用**
 
 **场景 2: 非 GSP 模式（传统模式）**
-- **条件**: `IS_FW_CLIENT(pGpu) == FALSE`
+- **条件**: `IS_GSP_CLIENT(pGpu) == FALSE`
 - **路径**: 本地执行路径
 - **结果**: `bValid = NV_FALSE`，数据无效
 - **本地函数**: **会调用**，但返回无效结果
 
 **场景 3: GSP 客户端模式但无 ROUTE_TO_PHYSICAL 标志**
-- **条件**: `IS_FW_CLIENT(pGpu) == TRUE` && `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL == FALSE`
+- **条件**: `IS_GSP_CLIENT(pGpu) == TRUE` && `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL == FALSE`
 - **路径**: 本地执行路径
 - **结果**: `bValid = NV_FALSE`，数据无效
 - **本地函数**: **会调用**，但返回无效结果
@@ -634,55 +630,60 @@ if (IS_FW_CLIENT(pGpu)) {
 
 ### 4.2 GSP RPC 控制实现
 **文件**: `src/nvidia/src/kernel/vgpu/rpc.c`  
-**函数**: `rpcRmApiControl_GSP` (行 10850)  
+**函数**: `rpcRmApiControl_GSP` (行 10361)  
 **作用**: 
 - 准备 RPC 消息头，确定 RPC 功能号为 `NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL`
 - 填充 RPC 参数结构 `rpc_gsp_rm_control_v03_00`:
-  - `hClient`, `hObject`, `cmd`, `paramsSize`
+  - `hClient`, `hObject`, `cmd`, `paramsSize`, `rmapiRpcFlags`
+  - `rmctrlFlags`, `rmctrlAccessRight` (额外字段)
   - 复制命令参数到 RPC 消息缓冲区
 - 处理大消息（超过缓冲区大小的情况）
-- 调用 `_issueRpcAndWait` 发送并等待响应
+- 调用 `_issueRpcAndWait` 或 `_issueRpcAndWaitLarge` 发送并等待响应
 
 **关键代码**:
 ```c
-// 行 10980-10982: 写入 RPC 消息头
+// 行 10491-10493: 写入 RPC 消息头
 NV_ASSERT_OK_OR_GOTO(status,
     rpcWriteCommonHeader(pGpu, pRpc, NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, rpc_params_size),
     done);
 
-// 行 10984-10990: 填充 RPC 参数
-rpc_params->hClient = hClient;
-rpc_params->hObject = hObject;
-rpc_params->cmd = cmd;
-rpc_params->paramsSize = paramsSize;
-rpc_params->rmapiRpcFlags = RMAPI_RPC_FLAGS_NONE;
+// 行 10495-10501: 填充 RPC 参数
+rpc_params->hClient        = hClient;
+rpc_params->hObject        = hObject;
+rpc_params->cmd            = cmd;
+rpc_params->paramsSize     = paramsSize;
+rpc_params->rmapiRpcFlags  = RMAPI_RPC_FLAGS_NONE;
+rpc_params->rmctrlFlags    = 0;
+rpc_params->rmctrlAccessRight = 0;
 
-// 行 11017: 复制参数数据
+// 行 10528: 复制参数数据
 portMemCopy(rpc_params->params, message_buffer_remaining, pParamStructPtr, paramsSize);
 
-// 行 11050: 发送并等待响应
-status = _issueRpcAndWait(pGpu, pRpc);
+// 行 10554-10562: 发送并等待响应（根据消息大小选择函数）
+if (large_message_copy) {
+    status = _issueRpcAndWaitLarge(pGpu, pRpc, total_size, large_message_copy, NV_TRUE);
+} else {
+    status = _issueRpcAndWait(pGpu, pRpc);
+}
 ```
 
 ### 4.3 RPC 发送消息
 **文件**: `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c`  
-**函数**: `_kgspRpcSendMessage` (行 388)  
+**函数**: `_kgspRpcSendMessage` (约行 386)  
 **作用**: 
-- 设置 RPC 序列号
-- 调用 `GspMsgQueueSendCommand` 将命令放入共享内存队列
+- 调用 `GspMsgQueueSendCommand` 将命令放入共享内存队列（序列号在 `GspMsgQueueSendCommand` 内部设置）
 - 调用 `kgspSetCmdQueueHead_HAL` 触发硬件中断
 
 **关键代码**:
 ```c
-// 行 402: 设置序列号
-vgpu_rpc_message_header_v->sequence = *pSequence = pRpc->sequence++;
-
-// 行 408: 发送命令到消息队列
+// 行 386: 发送命令到消息队列（序列号在内部设置）
 nvStatus = GspMsgQueueSendCommand(pRpc->pMessageQueueInfo, pGpu);
 
-// 行 422: 触发硬件中断
+// 行 400: 触发硬件中断
 kgspSetCmdQueueHead_HAL(pGpu, pKernelGsp, pRpc->pMessageQueueInfo->queueIdx, 0);
 ```
+
+**说明**: 序列号的设置实际在 `GspMsgQueueSendCommand` 函数内部完成（见 `message_queue_cpu.c:471`）。
 
 ### 4.4 消息队列发送命令
 **文件**: `src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c`  
@@ -740,7 +741,7 @@ GPU_REG_WR32(pGpu, NV_PGSP_QUEUE_HEAD(queueIdx), value);
 
 ### 5.2 RPC 接收轮询
 **文件**: `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c`  
-**函数**: `_kgspRpcRecvPoll` (行 2220)  
+**函数**: `_kgspRpcRecvPoll` (行 2176)  
 **作用**: 
 - 轮询模式等待 GSP 响应
 - 调用 `GspMsgQueueReceiveStatus` 读取状态队列
@@ -749,7 +750,7 @@ GPU_REG_WR32(pGpu, NV_PGSP_QUEUE_HEAD(queueIdx), value);
 
 **关键代码**:
 ```c
-// 行 2248-2253: 设置轮询上下文
+// 行 2202-2207: 设置轮询上下文
 KernelGspRpcEventHandlerContext rpcHandlerContext = KGSP_RPC_EVENT_HANDLER_CONTEXT_POLL;
 if (expectedFunc == NV_VGPU_MSG_EVENT_GSP_INIT_DONE) {
     rpcHandlerContext = KGSP_RPC_EVENT_HANDLER_CONTEXT_POLL_BOOTUP;
@@ -779,7 +780,7 @@ for (nRetries = 0; nRetries < nMaxRetries; nRetries++) {
 
 ### 5.4 RPC 响应处理
 **文件**: `src/nvidia/src/kernel/vgpu/rpc.c`  
-**函数**: `rpcRmApiControl_GSP` (行 11058-11089)  
+**函数**: `rpcRmApiControl_GSP` (行 10569-10596)  
 **作用**: 
 - 检查 RPC 传输状态
 - 从 RPC 响应中提取状态码 (`rpc_params->status`)
@@ -788,7 +789,7 @@ for (nRetries = 0; nRetries < nMaxRetries; nRetries++) {
 
 **关键代码**:
 ```c
-// 行 11058-11065: 检查响应状态
+// 行 10569-10576: 检查响应状态
 if (status == NV_OK) {
     if (rpc_params->status != NV_OK && !(rpc_params->rmapiRpcFlags & RMAPI_RPC_FLAGS_COPYOUT_ON_ERROR)) {
         status = rpc_params->status;
@@ -796,9 +797,16 @@ if (status == NV_OK) {
     }
 }
 
-// 行 11081-11084: 复制响应参数
-if (paramsSize != 0) {
-    portMemCopy(pParamStructPtr, paramsSize, rpc_params->params, paramsSize);
+// 行 10590-10595: 复制响应参数（处理序列化和非序列化两种情况）
+if (resCtrlFlags & NVOS54_FLAGS_FINN_SERIALIZED) {
+    // 序列化路径
+    portMemCopy(pCallContext->pSerializedParams, pCallContext->serializedSize, rpc_params->params, rpc_params->paramsSize);
+    // ... 反序列化 ...
+} else {
+    // 非序列化路径
+    if (paramsSize != 0) {
+        portMemCopy(pParamStructPtr, paramsSize, rpc_params->params, paramsSize);
+    }
 }
 ```
 
@@ -864,10 +872,10 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 1. 用户态: ioctl(NV_ESC_RM_CONTROL, ...)
    └─ 准备参数结构体
 
-2. 内核态: nvidia_ioctl (nv.c:2377)
+2. 内核态: nvidia_ioctl (nv.c:2419)
    └─ 复制参数到内核空间
 
-3. Escape 层: Nv04ControlWithSecInfo (escape.c:764)
+3. Escape 层: Nv04ControlWithSecInfo (escape.c:759)
    └─ 转换 file_private 为 hClient
 
 4. RMAPI 入口: _nv04ControlWithSecInfo (entry_points.c:493)
@@ -888,12 +896,12 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
    └─ 执行 Prologue 钩子
 
 8. RPC 路由拦截: rmresControl_Prologue_IMPL (resource.c:254)
-   ├─ 检查: IS_FW_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL
+   ├─ 检查: IS_GSP_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL
    ├─ ✅ 条件满足
    └─ 执行 RPC: NV_RM_RPC_CONTROL → pRmApi->Control()
        └─ 注意：pRmApi->Control 在 GSP 客户端模式下已被替换为 rpcRmApiControl_GSP
 
-9. RPC 直接发送: rpcRmApiControl_GSP (rpc.c:10977)
+9. RPC 直接发送: rpcRmApiControl_GSP (rpc.c:10361)
    ├─ 准备 RPC 消息头（跳过标准 RMAPI 流程）
    ├─ 填充 RPC 参数结构
    ├─ 复制命令参数到 RPC 消息缓冲区
@@ -938,7 +946,7 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 1-7. 与上述相同（用户态到多态分发）
 
 8. RPC 路由检查: rmresControl_Prologue_IMPL
-   ├─ 检查: IS_FW_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL
+   ├─ 检查: IS_GSP_CLIENT(pGpu) && RMCTRL_FLAGS_ROUTE_TO_PHYSICAL
    ├─ ❌ 条件不满足
    └─ 返回: NV_OK
 
@@ -961,7 +969,7 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 5. **同步等待**: 使用轮询或中断方式等待 GSP 响应
 6. **参数序列化**: 支持大消息的分片传输和序列化/反序列化
 7. **标志获取**: 命令标志在 `_rmapiRmControl` 阶段获取，存储在 Cookie 中传递
-8. **路径选择**: 基于 `IS_FW_CLIENT` 和 `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` 两个条件决定执行路径
+8. **路径选择**: 基于 `IS_GSP_CLIENT` 和 `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` 两个条件决定执行路径
 9. **函数指针替换**: 在 GSP 客户端模式下，`pRmApi->Control` 在初始化时被替换为 `rpcRmApiControl_GSP`，但标准路径使用 `ControlWithSecInfo`，因此不受影响；只有在 `NV_RM_RPC_CONTROL` 宏中调用 `pRmApi->Control()` 时才会使用替换后的函数
 
 ### 设计说明
@@ -987,8 +995,8 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 
 | 阶段 | 文件路径 | 函数/宏 | 行号 |
 |------|---------|---------|------|
-| 1.2 | `kernel-open/nvidia/nv.c` | `nvidia_ioctl` | 2377 |
-| 1.3 | `src/nvidia/arch/nvalloc/unix/src/escape.c` | `Nv04ControlWithSecInfo` | 764 |
+| 1.2 | `kernel-open/nvidia/nv.c` | `nvidia_ioctl` | 2419 |
+| 1.3 | `src/nvidia/arch/nvalloc/unix/src/escape.c` | `Nv04ControlWithSecInfo` | 759 |
 | 1.4 | `src/nvidia/src/kernel/rmapi/entry_points.c` | `_nv04ControlWithSecInfo` | 493 |
 | 2.1 | `src/nvidia/src/kernel/rmapi/control.c` | `rmapiControlWithSecInfo` | 1034 |
 | 2.2 | `src/nvidia/src/kernel/rmapi/control.c` | `_rmapiRmControl` | 350 |
@@ -1000,9 +1008,9 @@ typedef struct GSP_MSG_QUEUE_ELEMENT {
 | 3.4 | `src/nvidia/src/kernel/rmapi/resource.c` | `rmresControl_Prologue_IMPL` | 254 |
 | 3.4.1 | `src/nvidia/inc/kernel/rmapi/control.h` | `RMCTRL_FLAGS_ROUTE_TO_PHYSICAL` (标志定义) | 233 |
 | 4.1 | `src/nvidia/inc/kernel/vgpu/rpc.h` | `NV_RM_RPC_CONTROL` (宏) | 223 |
-| 4.2 | `src/nvidia/src/kernel/vgpu/rpc.c` | `rpcRmApiControl_GSP` | 10850 |
-| 4.3 | `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` | `_kgspRpcSendMessage` | 388 |
+| 4.2 | `src/nvidia/src/kernel/vgpu/rpc.c` | `rpcRmApiControl_GSP` | 10361 |
+| 4.3 | `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` | `_kgspRpcSendMessage` | ~386 |
 | 4.4 | `src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c` | `GspMsgQueueSendCommand` | 446 |
 | 4.5 | `src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c` | `kgspSetCmdQueueHead_TU102` | 341 |
-| 5.2 | `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` | `_kgspRpcRecvPoll` | 2220 |
+| 5.2 | `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` | `_kgspRpcRecvPoll` | 2176 |
 | 5.3 | `src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c` | `GspMsgQueueReceiveStatus` | 598 |
