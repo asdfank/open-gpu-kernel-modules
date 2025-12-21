@@ -554,6 +554,7 @@ SRCS += src/kernel/gpu/gsp/kernel_gsp_booter.c
 SRCS += src/kernel/gpu/gsp/kernel_gsp_fwsec.c
 SRCS += src/kernel/gpu/gsp/kernel_gsp_trace_rats.c
 SRCS += src/kernel/gpu/gsp/message_queue_cpu.c
+SRCS += src/kernel/gpu/gsp/gsp_fuzz_hook.c
 SRCS += src/kernel/gpu/gsplite/kernel_gsplite.c
 SRCS += src/kernel/gpu/host_eng/host_eng.c
 SRCS += src/kernel/gpu/hwpm/arch/blackwell/kern_hwpm_gb100.c

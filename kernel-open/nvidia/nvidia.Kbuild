@@ -54,6 +54,12 @@ nvidia-y += $(NVIDIA_BINARY_OBJECT_O)
 
 NVIDIA_CFLAGS += -I$(src)/nvidia
 NVIDIA_CFLAGS += -DNVIDIA_UNDEF_LEGACY_BIT_MACROS
+# ⭐ 修复：添加OS-agnostic层的include路径，使kernel-open层可以访问OS-agnostic层的头文件
+# 注意：需要包含多个路径，因为头文件使用相对路径（如 "core/prelude.h"）
+
+NVIDIA_CFLAGS += -I$(src)/../src/nvidia/inc
+NVIDIA_CFLAGS += -I$(src)/../src/nvidia/arch/nvalloc/unix/include
+NVIDIA_CFLAGS += -I$(src)/../src/nvidia/inc/libraries
 
 ifeq ($(NV_BUILD_TYPE),release)
  NVIDIA_CFLAGS += -UDEBUG -U_DEBUG -DNDEBUG

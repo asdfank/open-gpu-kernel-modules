@@ -66,6 +66,7 @@
 
 #include "gpu/sec2/kernel_sec2.h"
 #include "gpu/gsp/kernel_gsp.h"
+#include "gpu/gsp/gsp_fuzz_hook.h"
 #include "gpu/video/kernel_video_engine.h"
 #include "platform/platform.h"
 #include "platform/chipset/chipset.h"
@@ -561,6 +562,10 @@ gpuPostConstruct_IMPL
     // Initialize the GPU recovery action, if the OS is already in a bad state.
     pGpu->currentRecoveryAction = GPU_RECOVERY_ACTION_UNKNOWN;
     gpuRefreshRecoveryAction_KERNEL(pGpu, NV_TRUE);
+
+    // 初始化GSP Fuzz Hook（如果尚未初始化）
+    // 注意：gspFuzzHookInit 内部会处理幂等性，重复调用是安全的
+    gspFuzzHookInit();
 
     return NV_OK;
 }

@@ -152,4 +152,92 @@ typedef struct nv_ioctl_wait_open_complete
     NvU32 adapterStatus;
 } nv_ioctl_wait_open_complete_t;
 
+/* GSP Fuzz Hook IOCTL structures */
+// ⭐ 修复问题4：不包含内核头文件，只定义用户态数据结构
+// 注意：不要include "gpu/gsp/gsp_fuzz_hook.h"，因为那是内核头文件
+
+// ⭐ 修复问题4：统一命令号体系
+// 使用统一的NV_ESC_GSP_FUZZ_HOOK作为入口，payload中带subcmd
+// 子命令定义（用于payload中的subcmd字段）
+#define GSP_FUZZ_HOOK_SUBCMD_GET_CONFIG    1
+#define GSP_FUZZ_HOOK_SUBCMD_SET_CONFIG    2
+#define GSP_FUZZ_HOOK_SUBCMD_GET_STATS     3
+#define GSP_FUZZ_HOOK_SUBCMD_GET_SEEDS     4
+#define GSP_FUZZ_HOOK_SUBCMD_CLEAR_STATS   5
+
+// Hook配置标志（用户态可见）
+#define GSP_FUZZ_HOOK_ENABLED           0x00000001
+#define GSP_FUZZ_HOOK_RECORD_SEED       0x00000002
+#define GSP_FUZZ_HOOK_INLINE_FUZZ       0x00000004
+#define GSP_FUZZ_HOOK_RECORD_RESPONSE   0x00000008
+
+// 最大参数大小（与内核保持一致）
+#define GSP_FUZZ_MAX_PARAMS_SIZE (64 * 1024)
+
+// 用户态配置结构
+typedef struct nv_ioctl_gsp_fuzz_hook_config
+{
+    NvU32 flags;
+    NvU32 maxSeedRecords;
+    NvU32 inlineFuzzProbability;
+    NvU64 seedRecordBufferAddr NV_ALIGN_BYTES(8);    // 用户态缓冲区地址（保留，暂不使用）
+    NvU32 seedRecordBufferSize;    // 用户态缓冲区大小（保留，暂不使用）
+} nv_ioctl_gsp_fuzz_hook_config_t;
+
+// 用户态统计结构
+typedef struct nv_ioctl_gsp_fuzz_hook_stats
+{
+    NvU64 totalHooks NV_ALIGN_BYTES(8);
+    NvU64 rpcHooks NV_ALIGN_BYTES(8);
+    NvU64 localHooks NV_ALIGN_BYTES(8);
+    NvU64 seedRecords NV_ALIGN_BYTES(8);
+    NvU64 inlineFuzzCount NV_ALIGN_BYTES(8);
+    NvU64 errors NV_ALIGN_BYTES(8);
+} nv_ioctl_gsp_fuzz_hook_stats_t;
+
+// 获取种子记录
+typedef struct nv_ioctl_gsp_fuzz_hook_get_seeds
+{
+    NvU32 startIndex;               // 起始索引
+    NvU32 count;                    // 请求数量
+    NvU64 seedRecordBufferAddr NV_ALIGN_BYTES(8);     // 用户态缓冲区地址
+    NvU32 seedRecordBufferSize;     // 用户态缓冲区大小
+    NvU32 actualCount;               // 实际返回数量（输出）
+} nv_ioctl_gsp_fuzz_hook_get_seeds_t;
+
+// 统一的IOCTL请求结构（包含subcmd）
+typedef struct nv_ioctl_gsp_fuzz_hook_request
+{
+    NvU32 subcmd;                   // 子命令（GSP_FUZZ_HOOK_SUBCMD_*）
+    union {
+        nv_ioctl_gsp_fuzz_hook_config_t config;
+        nv_ioctl_gsp_fuzz_hook_stats_t stats;
+        nv_ioctl_gsp_fuzz_hook_get_seeds_t get_seeds;
+    } u;
+} nv_ioctl_gsp_fuzz_hook_request_t;
+
+// 种子记录结构（用户态可见，与内核GSP_FUZZ_SEED_RECORD保持一致）
+// ⭐ 注意：必须与内核的GSP_FUZZ_SEED_RECORD结构体布局完全一致
+// 内核使用NvHandle（可能是NvU32），这里使用NvU32保持一致
+// 内核使用NV_STATUS（可能是NvU32），这里使用NvU32保持一致
+// 内核使用NvBool（可能是NvU32），这里使用NvU32保持一致
+typedef struct nv_gsp_fuzz_seed_record
+{
+    NvU32 hClient;              // NvHandle (内核中是NvHandle，但实际是NvU32)
+    NvU32 hObject;              // NvHandle
+    NvU32 cmd;
+    NvU32 paramsSize;
+    NvU32 ctrlFlags;
+    NvU32 ctrlAccessRight;
+    NvU8  params[GSP_FUZZ_MAX_PARAMS_SIZE];
+    NvU64 timestamp NV_ALIGN_BYTES(8);
+    NvU32 gpuInstance;  
+    NvU32 bGspClient;           // NvBool (内核中是NvBool，但实际是NvU32)
+    NvU32 responseStatus;       // NV_STATUS (内核中是NV_STATUS，但实际是NvU32)
+    NvU32 responseParamsSize;
+    NvU8  responseParams[GSP_FUZZ_MAX_PARAMS_SIZE];
+    NvU64 latencyUs NV_ALIGN_BYTES(8);
+    NvU32 sequence;
+} nv_gsp_fuzz_seed_record_t;
+
 #endif

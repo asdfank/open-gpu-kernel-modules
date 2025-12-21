@@ -730,6 +730,13 @@ exit:
 static void
 nv_module_exit(nv_stack_t *sp)
 {
+    // ⭐ 关键修复：先清理 Hook 模块，再停 kthread/销毁锁，最后关闭 RM
+    // 顺序很重要！Hook cleanup 使用 nvport 函数，必须在 RM 活跃时调用
+    {
+        extern void gspFuzzHookCleanup(void);
+        gspFuzzHookCleanup();
+    }
+
     nv_module_state_exit(sp);
 
     rm_shutdown_rm(sp);
@@ -2770,6 +2777,23 @@ unlock:
 
             params->status = nv_dma_buf_export(nv, params);
 
+            break;
+        }
+
+        case NV_ESC_GSP_FUZZ_HOOK:
+        {
+            // GSP Fuzz Hook IOCTL处理
+            // ⭐ 修复问题4：使用统一的NV_ESC_GSP_FUZZ_HOOK入口，payload中带subcmd
+            {
+                // 声明处理函数（实际实现在gsp_fuzz_ioctl.c中）
+                extern int nvidia_ioctl_gsp_fuzz_hook(void *arg_copy, size_t arg_size);
+                
+                status = nvidia_ioctl_gsp_fuzz_hook(arg_copy, arg_size);
+                if (status != 0)
+                {
+                    goto done;
+                }
+            }
             break;
         }
 

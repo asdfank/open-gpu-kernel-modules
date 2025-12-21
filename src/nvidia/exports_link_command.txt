@@ -209,3 +209,14 @@
 --undefined=rm_acpi_nvpcf_notify
 --undefined=rm_notify_gpu_addition
 --undefined=rm_notify_gpu_removal
+--undefined=gspFuzzHookInit
+--undefined=gspFuzzHookCleanup
+--undefined=gspFuzzHookGetStats
+--undefined=gspFuzzHookSetConfig
+--undefined=gspFuzzHookGetConfig
+--undefined=gspFuzzHookClearStats
+--undefined=gspFuzzHookCopySeedsLocked
+--undefined=gspFuzzHookIsEnabled
+--undefined=gspFuzzHookIsResponseRecordingEnabled
+--undefined=gspFuzzHook_RmresControlPrologue
+--undefined=gspFuzzHook_RmresControlPrologueResponse

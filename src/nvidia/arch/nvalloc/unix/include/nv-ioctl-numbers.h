@@ -40,5 +40,6 @@
 #define NV_ESC_SYS_PARAMS            (NV_IOCTL_BASE + 14)
 #define NV_ESC_EXPORT_TO_DMABUF_FD   (NV_IOCTL_BASE + 17)
 #define NV_ESC_WAIT_OPEN_COMPLETE    (NV_IOCTL_BASE + 18)
+#define NV_ESC_GSP_FUZZ_HOOK         (NV_IOCTL_BASE + 19)
 
 #endif
