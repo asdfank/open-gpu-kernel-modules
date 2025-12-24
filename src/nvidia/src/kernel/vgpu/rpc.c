@@ -115,6 +115,9 @@
 
 #include "gpu/gsp/message_queue_priv.h"
 
+// ⭐ GSP Fuzz Hook 支持
+#include "gpu/gsp/gsp_fuzz_hook.h"
+
 static NvBool bProfileRPC = NV_FALSE;
 static NvU64 startTimeInNs, endTimeInNs, elapsedTimeInNs;
 
@@ -10392,6 +10395,15 @@ NV_STATUS rpcRmApiControl_GSP
     NvU32 resCtrlFlags = NVOS54_FLAGS_NONE;
     NvBool bPreSerialized = NV_FALSE;
     void *pOriginalParams = pParamStructPtr;
+    
+    // ⭐ Hook 点 2 变量声明（移到函数开头避免 -Wdeclaration-after-statement）
+    NvBool bFromPrologue = NV_FALSE;
+    NvBool bSerialized = NV_FALSE;
+    NvBool bInternalRpc = NV_FALSE;  // ⭐ 标记是否为内部触发的 RPC（无用户上下文）
+    NvU64 hook2StartUs = 0;
+    // ⭐ Hook2 请求快照（用于分离请求/响应）
+    void *pHook2RequestCopy = NULL;
+    NvU32 hook2RequestSize = 0;
 
     if (!rmDeviceGpuLockIsOwner(pGpu->gpuInstance))
     {
@@ -10424,9 +10436,19 @@ NV_STATUS rpcRmApiControl_GSP
         // This should only happen when using the internal physical RMAPI
         NV_ASSERT_OR_RETURN(pRmApi == GPU_GET_PHYSICAL_RMAPI(pGpu), NV_ERR_INVALID_STATE);
 
+        // ⭐ Hook2：无 TLS 调用上下文（或需要重新序列化）= 内部触发的 RPC
+        // 源码注释明确："This should only happen when using the internal physical RMAPI"
+        bInternalRpc = NV_TRUE;
+
         portMemSet(&newContext, 0, sizeof(newContext));
         pCallContext = &newContext;
         pCallContext->secInfo = pRmApi->defaultSecInfo;
+    }
+    else if (pCallContext->pControlParams != NULL && pCallContext->pControlParams->bInternal)
+    {
+        // ⭐ Hook2：有 TLS 上下文但 bInternal=TRUE = 内部调用（如 gpu.c 中的 _gpuRmApiControl）
+        // 这类内部调用会通过 resservSwapTlsCallContext 装入 TLS，但 bInternal=TRUE
+        bInternalRpc = NV_TRUE;
     }
 
     if (pCallContext->pControlParams != NULL)
@@ -10444,6 +10466,10 @@ NV_STATUS rpcRmApiControl_GSP
         if (status != NV_OK)
             goto done;
     }
+
+    // ⭐ Hook 点 2：检查是否来自 Prologue（用于去重）
+    bFromPrologue = gspFuzzHook_IsMarkedFromPrologue(hClient, hObject, cmd);
+    bSerialized = (resCtrlFlags & NVOS54_FLAGS_FINN_SERIALIZED) != 0;
 
     //
     // If this is a serializable API, rpc_params->params is a serialized buffer.
@@ -10479,6 +10505,29 @@ NV_STATUS rpcRmApiControl_GSP
         if (rmctrlCacheStatus == NV_OK)
         {
             goto done;
+        }
+    }
+
+    // ⭐ Hook 点 2：cache miss 之后调用 Hook（保证统计 = 实际 RPC 次数）
+    gspFuzzHook_RpcRmApiControl(
+        pGpu,
+        hClient,
+        hObject,
+        cmd,
+        pParamStructPtr,
+        paramsSize,
+        bSerialized,
+        bFromPrologue,
+        bInternalRpc    // ⭐ 传递 bInternalRpc 用于统计
+    );
+    
+    // 记录开始时间（用于延迟统计）
+    if (gspFuzzHookIsHook2Enabled() && !bFromPrologue)
+    {
+        NvU32 sec = 0, usec = 0;
+        if (osGetCurrentTime(&sec, &usec) == NV_OK)
+        {
+            hook2StartUs = (NvU64)sec * 1000000ULL + (NvU64)usec;
         }
     }
 
@@ -10530,6 +10579,20 @@ NV_STATUS rpcRmApiControl_GSP
                 status = NV_ERR_BUFFER_TOO_SMALL;
                 goto done;
             }
+            
+            // ⭐ Hook2：在 RPC 发送前保存请求快照（用于分离请求/响应）
+            // 此时 rpc_params->params 包含序列化后的请求数据
+            if (gspFuzzHookIsHook2Enabled() && !bFromPrologue)
+            {
+                NvU32 copySize = (paramsSize > GSP_FUZZ_MAX_PARAMS_SIZE) ? GSP_FUZZ_MAX_PARAMS_SIZE : paramsSize;
+                pHook2RequestCopy = portMemAllocNonPaged(copySize);
+                if (pHook2RequestCopy != NULL)
+                {
+                    portMemCopy(pHook2RequestCopy, copySize, rpc_params->params, copySize);
+                    hook2RequestSize = paramsSize;  // 只有分配成功才设置 size
+                }
+                // 分配失败时 hook2RequestSize 保持为 0，避免记录有 size 但内容全 0 的请求
+            }
         }
     }
     else if (pParamStructPtr != NULL)
@@ -10573,6 +10636,64 @@ NV_STATUS rpcRmApiControl_GSP
         {
             status = rpc_params->status;
             goto done;
+        }
+
+        // ⭐ Hook 点 2：在反序列化之前记录响应
+        // 此时 rpc_params->params 包含 RPC 返回的原始数据（序列化后的 buffer 或 flat struct）
+        if (gspFuzzHookIsHook2Enabled() && !bFromPrologue)
+        {
+            NvU64 hook2EndUs = 0;
+            NvU64 hook2LatencyUs = 0;
+            NvU8 seedSource = GSP_FUZZ_SEED_SOURCE_HOOK2_RPC;
+            NvU32 sec = 0, usec = 0;
+            
+            // 计算延迟（只有 start 和 end 都有效才计算，避免超大值）
+            if (osGetCurrentTime(&sec, &usec) == NV_OK)
+            {
+                hook2EndUs = (NvU64)sec * 1000000ULL + (NvU64)usec;
+            }
+            // 保护：hook2StartUs != 0 && hook2EndUs != 0 && hook2EndUs > hook2StartUs
+            if (hook2StartUs != 0 && hook2EndUs != 0 && hook2EndUs > hook2StartUs)
+            {
+                hook2LatencyUs = hook2EndUs - hook2StartUs;
+            }
+            // 否则 hook2LatencyUs 保持为 0
+            
+            // ⭐ 根据 TLS 调用上下文区分 INTERNAL 和 BYPASS
+            // - bInternalRpc=TRUE: 无用户上下文，驱动内部触发的 RPC
+            // - bInternalRpc=FALSE: 有用户上下文，但绕过了 Prologue（Hook点1）
+            if (bInternalRpc)
+            {
+                seedSource |= GSP_FUZZ_SEED_SOURCE_HOOK2_INTERNAL;
+            }
+            else
+            {
+                seedSource |= GSP_FUZZ_SEED_SOURCE_HOOK2_BYPASS;
+            }
+            
+            // 设置序列化标志
+            if (bSerialized)
+            {
+                seedSource |= GSP_FUZZ_SEED_SOURCE_SERIALIZED;
+            }
+            
+            // 记录种子：
+            // - pHook2RequestCopy: 请求快照（RPC 发送前保存的）
+            // - rpc_params->params: RPC 返回的响应（反序列化前的原始 buffer）
+            gspFuzzHook_RpcRmApiControlResponse(
+                pGpu,
+                hClient,
+                hObject,
+                cmd,
+                pHook2RequestCopy,        // 请求快照（序列化后的）
+                hook2RequestSize,         // 请求大小
+                bSerialized,
+                rpc_params->status,       // GSP 返回的状态
+                rpc_params->params,       // RPC 响应 buffer（反序列化前）
+                rpc_params->paramsSize,   // 响应大小
+                hook2LatencyUs,
+                seedSource
+            );
         }
 
         if (resCtrlFlags & NVOS54_FLAGS_FINN_SERIALIZED)
@@ -10627,6 +10748,12 @@ NV_STATUS rpcRmApiControl_GSP
     }
 
 done:
+    // ⭐ Hook2: 释放请求快照内存
+    if (pHook2RequestCopy != NULL)
+    {
+        portMemFree(pHook2RequestCopy);
+    }
+    
     if (gpuMaskRelease != 0)
     {
         rmGpuGroupLockRelease(gpuMaskRelease, GPUS_LOCK_FLAGS_NONE);

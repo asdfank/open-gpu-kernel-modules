@@ -207,6 +207,11 @@ static NV_STATUS gspFuzzHookRecordSeed(
     pRecord->latencyUs = latencyUs;
     pRecord->sequence = g_hookStats.seedRecords;
     
+    // ⭐ Hook 点 1 的种子来源标记
+    pRecord->seedSource = GSP_FUZZ_SEED_SOURCE_HOOK1_PROLOGUE;
+    pRecord->bSerialized = 0;  // Hook 点 1 记录的是原始参数（未序列化）
+    pRecord->reserved = 0;
+    
     // 复制参数数据（使用clamp后的长度）
     if (pParams != NULL && clampedParamsSize > 0)
     {
@@ -557,12 +562,22 @@ void gspFuzzHookClearStats(void)
 {
     if (g_pSeedRecordLock != NULL)
     {
-        // ⭐ 修复：使用正确的函数名portSyncSpinlockAcquire
-    portSyncSpinlockAcquire(g_pSeedRecordLock);
+        portSyncSpinlockAcquire(g_pSeedRecordLock);
+        
+        // 清零统计信息
         portMemSet(&g_hookStats, 0, sizeof(g_hookStats));
+        
+        // 重置索引
         g_seedRecordIndex = 0;
-        // ⭐ 修复：使用正确的函数名portSyncSpinlockRelease
-    portSyncSpinlockRelease(g_pSeedRecordLock);
+        
+        // ⭐ 清空种子缓冲区内容，避免读取到旧数据
+        if (g_pSeedRecordBuffer != NULL && g_hookConfig.maxSeedRecords > 0)
+        {
+            portMemSet(g_pSeedRecordBuffer, 0, 
+                       g_hookConfig.maxSeedRecords * sizeof(GSP_FUZZ_SEED_RECORD));
+        }
+        
+        portSyncSpinlockRelease(g_pSeedRecordLock);
     }
 }
 
@@ -628,4 +643,296 @@ NvU32 gspFuzzHookCopySeedsLocked(
     portSyncSpinlockRelease(g_pSeedRecordLock);
     
     return actualCount;
+}
+
+// ============================================================================
+// ⭐ Hook 点 2 实现：rpcRmApiControl_GSP 序列化之后的 Hook
+// ============================================================================
+
+// 去重标记：使用环形缓冲区记录最近的 Prologue 调用
+// ⭐ 修复：增大缓冲区大小（16→64）降低高并发时被覆盖的概率
+#define GSP_FUZZ_DEDUP_BUFFER_SIZE  64
+
+typedef struct {
+    NvHandle hClient;
+    NvHandle hObject;
+    NvU32    cmd;
+    NvU64    timestamp;  // 用于过期清理（微秒）
+} GSP_FUZZ_DEDUP_ENTRY;
+
+static GSP_FUZZ_DEDUP_ENTRY g_dedupBuffer[GSP_FUZZ_DEDUP_BUFFER_SIZE] = {0};
+static NvU32 g_dedupIndex = 0;
+
+// 检查 Hook 点 2 是否启用
+NvBool gspFuzzHookIsHook2Enabled(void)
+{
+    return g_bHookEnabled && (g_hookConfig.flags & GSP_FUZZ_HOOK_HOOK2_ENABLED);
+}
+
+// 设置当前 RPC 调用来自 Prologue 的标记（用于去重）
+void gspFuzzHook_MarkFromPrologue(NvHandle hClient, NvHandle hObject, NvU32 cmd)
+{
+    NvU32 sec = 0, usec = 0;
+    NvU64 timestamp = 0;
+    NvU32 index;
+    
+    if (!gspFuzzHookIsHook2Enabled())
+        return;
+    
+    // ⭐ 修复：取时失败时直接返回，避免写入无效条目浪费槽位
+    if (osGetCurrentTime(&sec, &usec) != NV_OK)
+        return;
+    
+    timestamp = (NvU64)sec * 1000000ULL + (NvU64)usec;
+    
+    // ⭐ 极端情况保护：timestamp=0 不会被匹配，也不要写入
+    if (timestamp == 0)
+        return;
+    
+    // 在去重缓冲区中记录
+    if (g_pSeedRecordLock != NULL)
+    {
+        portSyncSpinlockAcquire(g_pSeedRecordLock);
+        
+        index = g_dedupIndex;
+        g_dedupBuffer[index].hClient = hClient;
+        g_dedupBuffer[index].hObject = hObject;
+        g_dedupBuffer[index].cmd = cmd;
+        g_dedupBuffer[index].timestamp = timestamp;
+        g_dedupIndex = (g_dedupIndex + 1) % GSP_FUZZ_DEDUP_BUFFER_SIZE;
+        
+        portSyncSpinlockRelease(g_pSeedRecordLock);
+    }
+}
+
+// 检查当前 RPC 调用是否来自 Prologue（用于去重）
+// 如果在最近的去重缓冲区中找到匹配项，则返回 NV_TRUE
+// ⭐ 优化：从最新条目开始向前搜索（LIFO），提高命中效率
+NvBool gspFuzzHook_IsMarkedFromPrologue(NvHandle hClient, NvHandle hObject, NvU32 cmd)
+{
+    NvU32 i;
+    NvU32 idx;
+    NvU32 sec = 0, usec = 0;
+    NvU64 currentTime = 0;
+    NvBool found = NV_FALSE;
+    
+    if (!gspFuzzHookIsHook2Enabled())
+        return NV_FALSE;
+    
+    // ⭐ 修复：取时失败时直接返回，避免无意义扫描
+    if (osGetCurrentTime(&sec, &usec) != NV_OK)
+        return NV_FALSE;
+    
+    currentTime = (NvU64)sec * 1000000ULL + (NvU64)usec;
+    
+    // ⭐ 极端情况保护
+    if (currentTime == 0)
+        return NV_FALSE;
+    
+    if (g_pSeedRecordLock != NULL)
+    {
+        portSyncSpinlockAcquire(g_pSeedRecordLock);
+        
+        // ⭐ 优化：从最新条目开始向前搜索（LIFO顺序）
+        // 因为 Prologue 和 RPC 通常间隔很短，最新的条目最可能匹配
+        for (i = 0; i < GSP_FUZZ_DEDUP_BUFFER_SIZE; i++)
+        {
+            // 从 g_dedupIndex-1 开始向前遍历（环形）
+            idx = (g_dedupIndex + GSP_FUZZ_DEDUP_BUFFER_SIZE - 1 - i) % GSP_FUZZ_DEDUP_BUFFER_SIZE;
+            
+            // 检查是否匹配且未过期（1秒内）
+            // ⭐ 下溢保护：currentTime >= timestamp
+            if (g_dedupBuffer[idx].hClient == hClient &&
+                g_dedupBuffer[idx].hObject == hObject &&
+                g_dedupBuffer[idx].cmd == cmd &&
+                g_dedupBuffer[idx].timestamp > 0 &&
+                currentTime >= g_dedupBuffer[idx].timestamp &&
+                (currentTime - g_dedupBuffer[idx].timestamp) < 1000000)  // 1秒内
+            {
+                // 找到匹配，清除该条目（只匹配一次）
+                g_dedupBuffer[idx].hClient = 0;
+                g_dedupBuffer[idx].hObject = 0;
+                g_dedupBuffer[idx].cmd = 0;
+                g_dedupBuffer[idx].timestamp = 0;
+                found = NV_TRUE;
+                break;
+            }
+        }
+        
+        portSyncSpinlockRelease(g_pSeedRecordLock);
+    }
+    
+    return found;
+}
+
+// ⭐ Hook 点 2 主函数：在 rpcRmApiControl_GSP 序列化之后调用
+// 此函数在 RPC 发送前调用，主要用于：
+// 1. 记录绕过 Prologue 的 RPC 调用
+// 2. 记录驱动内部触发的 RPC 调用
+// 3. 对于已序列化的 FINN API，可以在这里捕获序列化后的数据
+//
+// ⭐ 统计口径说明（互斥分类，总和等于 hook2TotalHooks）：
+// - hook2TotalHooks: 所有经过 Hook2 的 RPC 次数
+// - hook2Duplicates: 来自 Prologue 的 RPC（已被 Hook1 记录）
+// - hook2InternalHooks: 驱动内部触发的 RPC（非 Prologue 路径）
+// - hook2BypassHooks: 绕过 Prologue 的用户态 RPC
+// - hook2SerializedHooks: 已序列化的 API 次数（仅统计 Hook2 独有的）
+// - hook2SeedRecords: Hook2 独有的新增种子数（非 duplicate）
+void gspFuzzHook_RpcRmApiControl(
+    OBJGPU *pGpu,
+    NvHandle hClient,
+    NvHandle hObject,
+    NvU32 cmd,
+    void *pParams,
+    NvU32 paramsSize,
+    NvBool bSerialized,
+    NvBool bFromPrologue,
+    NvBool bInternalRpc    // ⭐ 使用更准确的内部判断
+)
+{
+    // 检查 Hook 点 2 是否启用
+    if (!gspFuzzHookIsHook2Enabled())
+        return;
+    
+    // ⭐ 修复问题1：直接使用传进来的 bFromPrologue，不再重复查询
+    // 因为 rpc.c 已经调用了 gspFuzzHook_IsMarkedFromPrologue() 并传入结果
+    // 再次查询会浪费时间，且由于 ring buffer 过期机制可能导致不一致
+    NvBool bIsDuplicate = bFromPrologue;
+    
+    // 统计
+    if (g_pSeedRecordLock != NULL)
+    {
+        portSyncSpinlockAcquire(g_pSeedRecordLock);
+        
+        // hook2TotalHooks: 所有经过 Hook2 的 RPC 次数
+        g_hookStats.hook2TotalHooks++;
+        
+        // ⭐ 来源分类（互斥）：total = duplicate + bypass + internal
+        // 先判断 bFromPrologue，因为来自 Prologue 的 RPC 已被 Hook1 记录，
+        // 不管它是否被标记为 internal，都应该计入 duplicate
+        if (bFromPrologue)
+        {
+            // 来自标准 RM 路径（已被 Hook1 记录）
+            g_hookStats.hook2Duplicates++;
+        }
+        else if (bInternalRpc)
+        {
+            // 驱动内部触发（无用户上下文）
+            g_hookStats.hook2InternalHooks++;
+        }
+        else
+        {
+            // 绕过 Prologue（用户态调用但未经 Hook1）
+            g_hookStats.hook2BypassHooks++;
+        }
+        
+        // 种子统计：Hook2 独有的（非 duplicate）
+        if (!bIsDuplicate)
+        {
+            // 这是 Hook 点 2 独有的 RPC 调用
+            // serialized 只统计 Hook2 独有的（因为 Hook1 记录的是原始参数）
+            if (bSerialized)
+            {
+                g_hookStats.hook2SerializedHooks++;
+            }
+        }
+        
+        portSyncSpinlockRelease(g_pSeedRecordLock);
+    }
+}
+
+// ⭐ Hook 点 2：RPC 返回后记录响应和种子
+void gspFuzzHook_RpcRmApiControlResponse(
+    OBJGPU *pGpu,
+    NvHandle hClient,
+    NvHandle hObject,
+    NvU32 cmd,
+    void *pParams,
+    NvU32 paramsSize,
+    NvBool bSerialized,
+    NV_STATUS responseStatus,
+    void *pResponseParams,
+    NvU32 responseParamsSize,
+    NvU64 latencyUs,
+    NvU8 seedSource
+)
+{
+    GSP_FUZZ_SEED_RECORD *pRecord = NULL;
+    NvU32 index;
+    NvU32 clampedParamsSize;
+    NvU32 clampedResponseParamsSize;
+    
+    // 检查 Hook 点 2 是否启用且需要记录种子
+    if (!gspFuzzHookIsHook2Enabled() || 
+        !(g_hookConfig.flags & GSP_FUZZ_HOOK_RECORD_SEED))
+        return;
+    
+    // 如果 seedSource 包含 HOOK1_PROLOGUE，说明 Hook 点 1 已经记录，跳过
+    if (seedSource & GSP_FUZZ_SEED_SOURCE_HOOK1_PROLOGUE)
+        return;
+    
+    if (g_pSeedRecordBuffer == NULL || g_hookConfig.maxSeedRecords == 0)
+        return;
+    
+    // 参数大小 clamp
+    clampedParamsSize = NV_MIN(paramsSize, GSP_FUZZ_MAX_PARAMS_SIZE);
+    clampedResponseParamsSize = NV_MIN(responseParamsSize, GSP_FUZZ_MAX_PARAMS_SIZE);
+    
+    // 获取锁并分配记录槽
+    if (g_pSeedRecordLock == NULL)
+        return;
+    
+    portSyncSpinlockAcquire(g_pSeedRecordLock);
+    
+    index = g_seedRecordIndex;
+    g_seedRecordIndex = (g_seedRecordIndex + 1) % g_hookConfig.maxSeedRecords;
+    
+    pRecord = &g_pSeedRecordBuffer[index];
+    
+    // 填充记录
+    portMemSet(pRecord, 0, sizeof(GSP_FUZZ_SEED_RECORD));
+    pRecord->hClient = hClient;
+    pRecord->hObject = hObject;
+    pRecord->cmd = cmd;
+    pRecord->paramsSize = clampedParamsSize;
+    pRecord->ctrlFlags = 0;  // Hook 点 2 无法获取 ctrlFlags
+    pRecord->ctrlAccessRight = 0;
+    pRecord->gpuInstance = pGpu ? pGpu->gpuInstance : 0;
+    pRecord->bGspClient = pGpu ? IS_GSP_CLIENT(pGpu) : NV_FALSE;
+    
+    // 时间戳
+    NvU32 sec = 0, usec = 0;
+    if (osGetCurrentTime(&sec, &usec) == NV_OK)
+    {
+        pRecord->timestamp = (NvU64)sec * 1000000000ULL + (NvU64)usec * 1000ULL;
+    }
+    
+    pRecord->responseStatus = responseStatus;
+    pRecord->responseParamsSize = clampedResponseParamsSize;
+    pRecord->latencyUs = latencyUs;
+    pRecord->sequence = g_hookStats.seedRecords;
+    
+    // ⭐ Hook 点 2 扩展字段
+    pRecord->seedSource = seedSource;
+    pRecord->bSerialized = bSerialized ? 1 : 0;
+    pRecord->reserved = 0;
+    
+    // 复制参数数据
+    if (pParams != NULL && clampedParamsSize > 0)
+    {
+        portMemCopy(pRecord->params, GSP_FUZZ_MAX_PARAMS_SIZE, pParams, clampedParamsSize);
+    }
+    
+    // 复制响应数据
+    if ((g_hookConfig.flags & GSP_FUZZ_HOOK_RECORD_RESPONSE) &&
+        pResponseParams != NULL && clampedResponseParamsSize > 0)
+    {
+        portMemCopy(pRecord->responseParams, GSP_FUZZ_MAX_PARAMS_SIZE,
+                    pResponseParams, clampedResponseParamsSize);
+    }
+    
+    g_hookStats.seedRecords++;
+    g_hookStats.hook2SeedRecords++;
+    
+    portSyncSpinlockRelease(g_pSeedRecordLock);
 }

@@ -96,12 +96,20 @@ int nvidia_ioctl_gsp_fuzz_hook(
             gspFuzzHookGetStats(&kernelStats);
             
             // 转换内核统计到用户态统计
+            // Hook 点 1 统计
             userStats->totalHooks = kernelStats.totalHooks;
             userStats->rpcHooks = kernelStats.rpcHooks;
             userStats->localHooks = kernelStats.localHooks;
             userStats->seedRecords = kernelStats.seedRecords;
             userStats->inlineFuzzCount = kernelStats.inlineFuzzCount;
             userStats->errors = kernelStats.errors;
+            // ⭐ 修复：添加 Hook 点 2 统计字段复制
+            userStats->hook2TotalHooks = kernelStats.hook2TotalHooks;
+            userStats->hook2BypassHooks = kernelStats.hook2BypassHooks;
+            userStats->hook2InternalHooks = kernelStats.hook2InternalHooks;
+            userStats->hook2SerializedHooks = kernelStats.hook2SerializedHooks;
+            userStats->hook2Duplicates = kernelStats.hook2Duplicates;
+            userStats->hook2SeedRecords = kernelStats.hook2SeedRecords;
             
             break;
         }

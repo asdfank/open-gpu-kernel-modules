@@ -330,7 +330,15 @@ rmresControl_Prologue_IMPL
         // This is not valid in offload mode, but is in monolithic.
         // In those cases, just acquire the lock for the RPC
         //
+        // ⭐ 修复：变量声明移到 if 块开头（避免 -Wdeclaration-after-statement）
         GPU_MASK gpuMaskRelease = 0;
+        NvU32 sec = 0, usec = 0;
+        NvU64 rpcStartUs = 0;
+        NvU64 rpcEndUs = 0;
+        void *pRpcParams = NULL;
+        NvU32 rpcParamsSize = 0;
+        void *pResponseParamsCopy = NULL;
+        
         if (!rmDeviceGpuLockIsOwner(pGpu->gpuInstance))
         {
             //
@@ -346,35 +354,33 @@ rmresControl_Prologue_IMPL
         }
 
         // ⭐ 记录RPC调用开始时间（真实RPC延迟测量）
-        // ⭐ 修复：使用osGetCurrentTime()计算时间戳（该函数已确认存在且可见）
-        NvU32 sec = 0, usec = 0;
-        NvU64 rpcStartUs = 0;
         if (osGetCurrentTime(&sec, &usec) == NV_OK)
         {
             rpcStartUs = (NvU64)sec * 1000000ULL + (NvU64)usec;
         }
 
         // ⭐ 使用变异后的参数（如果启用inline fuzz），否则使用原始参数
-        void *pRpcParams = (pMutatedParams != NULL) ? pMutatedParams : pParams->pParams;
-        NvU32 rpcParamsSize = (pMutatedParams != NULL) ? mutatedParamsSize : pParams->paramsSize;
+        pRpcParams = (pMutatedParams != NULL) ? pMutatedParams : pParams->pParams;
+        rpcParamsSize = (pMutatedParams != NULL) ? mutatedParamsSize : pParams->paramsSize;
+
+        // ⭐ Hook 点 2 去重标记：在 RPC 调用前标记此调用来自 Prologue
+        gspFuzzHook_MarkFromPrologue(pParams->hClient, pParams->hObject, pParams->cmd);
 
         NV_RM_RPC_CONTROL(pGpu, pParams->hClient, pParams->hObject, pParams->cmd,
                           pRpcParams, rpcParamsSize, status);
 
         // ⭐ 计算真实RPC延迟（从发送到接收的完整往返时间）
-        // ⭐ 修复：使用osGetCurrentTime()计算结束时间
         sec = usec = 0;
-        NvU64 rpcEndUs = rpcStartUs;  // 默认值，如果获取失败则使用开始时间
+        rpcEndUs = rpcStartUs;  // 默认值，如果获取失败则使用开始时间
         if (osGetCurrentTime(&sec, &usec) == NV_OK)
         {
             rpcEndUs = (NvU64)sec * 1000000ULL + (NvU64)usec;
         }
         latencyUs = (rpcEndUs > rpcStartUs) ? (rpcEndUs - rpcStartUs) : 0;
 
-        // ⭐ 修复问题2：响应记录逻辑
+        // ⭐ 响应记录逻辑
         // 如果启用了inline fuzz，响应可能写在pMutatedParams上，但我们在记录前就free了
         // 方案：如果启用了inline fuzz，禁用响应记录（seed是合法的原始请求，响应是fuzz后的，不匹配）
-        void *pResponseParamsCopy = NULL;
         
         if (gspFuzzHookIsResponseRecordingEnabled() && pMutatedParams == NULL)
         {

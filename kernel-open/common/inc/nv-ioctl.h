@@ -183,12 +183,20 @@ typedef struct nv_ioctl_gsp_fuzz_hook_config
 // 用户态统计结构
 typedef struct nv_ioctl_gsp_fuzz_hook_stats
 {
+    // Hook 点 1 统计
     NvU64 totalHooks NV_ALIGN_BYTES(8);
     NvU64 rpcHooks NV_ALIGN_BYTES(8);
     NvU64 localHooks NV_ALIGN_BYTES(8);
     NvU64 seedRecords NV_ALIGN_BYTES(8);
     NvU64 inlineFuzzCount NV_ALIGN_BYTES(8);
     NvU64 errors NV_ALIGN_BYTES(8);
+    // Hook 点 2 统计
+    NvU64 hook2TotalHooks NV_ALIGN_BYTES(8);
+    NvU64 hook2BypassHooks NV_ALIGN_BYTES(8);
+    NvU64 hook2InternalHooks NV_ALIGN_BYTES(8);
+    NvU64 hook2SerializedHooks NV_ALIGN_BYTES(8);
+    NvU64 hook2Duplicates NV_ALIGN_BYTES(8);
+    NvU64 hook2SeedRecords NV_ALIGN_BYTES(8);
 } nv_ioctl_gsp_fuzz_hook_stats_t;
 
 // 获取种子记录
@@ -231,6 +239,10 @@ typedef struct nv_gsp_fuzz_seed_record
     NvU8  responseParams[GSP_FUZZ_MAX_PARAMS_SIZE];
     NvU64 latencyUs NV_ALIGN_BYTES(8);
     NvU32 sequence;
+    // Hook 点 2 扩展字段
+    NvU8  seedSource;           // 种子来源：GSP_FUZZ_SEED_SOURCE_*
+    NvU8  bSerialized;          // 参数是否已序列化（FINN API）
+    NvU16 reserved;             // 对齐填充
 } nv_gsp_fuzz_seed_record_t;
 
 #endif

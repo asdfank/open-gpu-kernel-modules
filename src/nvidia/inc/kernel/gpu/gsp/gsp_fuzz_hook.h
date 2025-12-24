@@ -16,6 +16,14 @@ typedef struct PORT_SPINLOCK PORT_SPINLOCK;
 #define GSP_FUZZ_HOOK_RECORD_SEED       0x00000002
 #define GSP_FUZZ_HOOK_INLINE_FUZZ       0x00000004
 #define GSP_FUZZ_HOOK_RECORD_RESPONSE   0x00000008
+#define GSP_FUZZ_HOOK_HOOK2_ENABLED     0x00000010  // ⭐ 启用 Hook 点 2
+
+// ⭐ 种子来源类型（用于区分 Hook 点 1 和 Hook 点 2）
+#define GSP_FUZZ_SEED_SOURCE_HOOK1_PROLOGUE     0x01  // 来自 Hook 点 1（rmresControl_Prologue）
+#define GSP_FUZZ_SEED_SOURCE_HOOK2_RPC          0x02  // 来自 Hook 点 2（rpcRmApiControl_GSP）
+#define GSP_FUZZ_SEED_SOURCE_HOOK2_BYPASS       0x04  // Hook 点 2: 绕过 Prologue 的 RPC
+#define GSP_FUZZ_SEED_SOURCE_HOOK2_INTERNAL     0x08  // Hook 点 2: 驱动内部触发的 RPC
+#define GSP_FUZZ_SEED_SOURCE_SERIALIZED         0x10  // 参数已序列化（FINN API）
 
 // 种子记录结构
 typedef struct gsp_fuzz_seed_record
@@ -44,17 +52,30 @@ typedef struct gsp_fuzz_seed_record
     // 统计信息
     NvU64    latencyUs;           // 延迟（微秒）
     NvU32    sequence;             // 序列号（用于去重）
+    
+    // ⭐ Hook 点 2 扩展字段
+    NvU8     seedSource;           // 种子来源：GSP_FUZZ_SEED_SOURCE_*
+    NvU8     bSerialized;          // 参数是否已序列化（FINN API）
+    NvU16    reserved;             // 保留对齐
 } GSP_FUZZ_SEED_RECORD;
 
 // Hook统计信息
 typedef struct gsp_fuzz_hook_stats
 {
     NvU64 totalHooks;              // 总Hook次数
-    NvU64 rpcHooks;                // RPC路径Hook次数
+    NvU64 rpcHooks;                // RPC路径Hook次数（Hook 点 1）
     NvU64 localHooks;               // 本地路径Hook次数
     NvU64 seedRecords;              // 种子记录数
     NvU64 inlineFuzzCount;         // 在线Fuzz次数
     NvU64 errors;                   // 错误次数
+    
+    // ⭐ Hook 点 2 统计
+    NvU64 hook2TotalHooks;         // Hook 点 2 总次数
+    NvU64 hook2BypassHooks;        // Hook 点 2: 绕过 Prologue 的 RPC
+    NvU64 hook2InternalHooks;      // Hook 点 2: 驱动内部触发的 RPC
+    NvU64 hook2SerializedHooks;    // Hook 点 2: 已序列化的 API
+    NvU64 hook2Duplicates;         // Hook 点 2: 去重跳过的次数（Hook 点 1 已记录）
+    NvU64 hook2SeedRecords;        // Hook 点 2 新增的种子数
 } GSP_FUZZ_HOOK_STATS;
 
 // Hook配置
@@ -99,6 +120,51 @@ NV_STATUS gspFuzzHookSetConfig(GSP_FUZZ_HOOK_CONFIG *pConfig);
 void gspFuzzHookGetConfig(GSP_FUZZ_HOOK_CONFIG *pConfig);
 NvBool gspFuzzHookIsResponseRecordingEnabled(void);
 NvBool gspFuzzHookIsEnabled(void);
+NvBool gspFuzzHookIsHook2Enabled(void);  // ⭐ Hook 点 2 是否启用
+
+// ⭐ Hook 点 2 函数声明
+// 在 rpcRmApiControl_GSP 序列化之后、RPC 发送之前调用
+// 参数：
+//   pGpu: GPU 对象
+//   hClient, hObject, cmd: RPC 调用参数
+//   pParams: 参数指针（可能已序列化）
+//   paramsSize: 参数大小
+//   bSerialized: 参数是否已序列化（FINN API）
+//   bFromPrologue: 是否来自 Hook 点 1（用于去重）
+//   bInternalRpc: 是否为内部 RPC（用于统计区分）
+void gspFuzzHook_RpcRmApiControl(
+    OBJGPU *pGpu,
+    NvHandle hClient,
+    NvHandle hObject,
+    NvU32 cmd,
+    void *pParams,
+    NvU32 paramsSize,
+    NvBool bSerialized,
+    NvBool bFromPrologue,
+    NvBool bInternalRpc    // ⭐ 传递准确的内部判断用于统计
+);
+
+// ⭐ 在 RPC 返回后记录响应（Hook 点 2 使用）
+void gspFuzzHook_RpcRmApiControlResponse(
+    OBJGPU *pGpu,
+    NvHandle hClient,
+    NvHandle hObject,
+    NvU32 cmd,
+    void *pParams,
+    NvU32 paramsSize,
+    NvBool bSerialized,
+    NV_STATUS responseStatus,
+    void *pResponseParams,
+    NvU32 responseParamsSize,
+    NvU64 latencyUs,
+    NvU8 seedSource
+);
+
+// ⭐ 设置当前 RPC 调用来自 Prologue 的标记（用于去重）
+void gspFuzzHook_MarkFromPrologue(NvHandle hClient, NvHandle hObject, NvU32 cmd);
+
+// ⭐ 检查当前 RPC 调用是否来自 Prologue（用于去重）
+NvBool gspFuzzHook_IsMarkedFromPrologue(NvHandle hClient, NvHandle hObject, NvU32 cmd);
 
 // IOCTL处理辅助函数（导出内部状态访问）
 NvU32 gspFuzzHookGetSeedRecordIndex(void);

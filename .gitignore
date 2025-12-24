@@ -3,3 +3,6 @@
 *.o.cmd
 *.o.d
 _out/
+
+# GSP Fuzz Hook 运行时生成的种子数据（不应提交）
+tools/hook/gsp_fuzz_seeds/
